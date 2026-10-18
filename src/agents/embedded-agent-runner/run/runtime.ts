@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { raceWithTimeout } from "@openclaw/retry";
 import { readSourceReplyDeliveryRuntime } from "../../../auto-reply/reply/source-reply-delivery-runtime.js";
 import { resolveMergedModelProviderConfig } from "../../../config/model-provider-config.js";
 import type { ProviderRuntimeModel } from "../../../plugins/provider-runtime-model.types.js";
@@ -28,6 +29,40 @@ import { providerUsesCredentialScopedModelMetadata } from "../../runtime-plan/cr
 import { log } from "../logger.js";
 import { prepareEmbeddedRunTransport } from "./runtime-preparation.js";
 import { resolveRequestStreamTransportOverrides } from "./runtime-resolution.js";
+
+/** Bounds best-effort disposal so a stuck transport cannot keep the run pending forever. */
+const TRANSPORT_LEASE_DISPOSAL_TIMEOUT_MS = 5_000;
+
+/**
+ * Lease disposal is best effort: a rejected or stuck dispose must never turn a
+ * settled turn into a failure, so failures are logged and the wait is bounded.
+ */
+async function disposeTransportLeases(
+  leases: PreparedModelRuntimeLease[],
+  phase: "refresh" | "release",
+): Promise<void> {
+  if (leases.length === 0) {
+    return;
+  }
+  const disposals = leases.map((lease) => Promise.resolve().then(() => lease[Symbol.asyncDispose]()));
+  const settled = await raceWithTimeout(
+    Promise.allSettled(disposals),
+    TRANSPORT_LEASE_DISPOSAL_TIMEOUT_MS,
+    () => "timeout" as const,
+    { ref: false },
+  );
+  if (settled === "timeout") {
+    log.warn(
+      `transport lease disposal timed out during ${phase}: leases=${leases.length} timeoutMs=${TRANSPORT_LEASE_DISPOSAL_TIMEOUT_MS}`,
+    );
+    return;
+  }
+  for (const outcome of settled) {
+    if (outcome.status === "rejected") {
+      log.warn(`transport lease disposal failed during ${phase}: ${String(outcome.reason)}`);
+    }
+  }
+}
 
 /** Admission and request policy survive replacement of a failed configured transport. */
 export async function prepareEmbeddedRunRuntime(
@@ -242,14 +277,14 @@ export async function prepareEmbeddedRunRuntime(
       } finally {
         if (candidate !== transport) {
           candidate?.stopRuntimeAuthRefreshTimer();
-          await lease?.[Symbol.asyncDispose]();
+          await disposeTransportLeases(lease ? [lease] : [], "refresh");
         }
       }
     },
     stopRuntimeAuthRefreshTimer: () => transport.stopRuntimeAuthRefreshTimer(),
     releaseTransport: async () => {
       transport.stopRuntimeAuthRefreshTimer();
-      await Promise.all(leases.splice(0).map((lease) => lease[Symbol.asyncDispose]()));
+      await disposeTransportLeases(leases.splice(0), "release");
     },
   };
 }
